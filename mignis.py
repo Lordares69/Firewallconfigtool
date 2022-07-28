@@ -193,7 +193,7 @@ class Rule:
         else:
             return all_addresses
 
-    def _format_intfip(self, srcdst, direction, params, iponly=False, portonly=False):
+    def _format_intfip(self, srcdst, direction, params, iponly=False, portonly=False, port_override=None):
         '''Given 'srcdst' (which specifies if we want a source (s) or destination (d) filter type),
         converts the given address (which may be any of: alias, interface, ip, port) to a string ready for filtering in the form
         '-[io] intf -[ds] ip --[sd]port port'.
@@ -232,7 +232,15 @@ class Rule:
                 r = ''
 
         if params[port]:
-            r += ' --{0}port {1}'.format(srcdst, ':'.join(map(str, params[port])))
+            if port_override:
+                # If port_override is a list
+                try:
+                    r += ' --{0}port {1}'.format(srcdst, ':'.join(map(str, port_override)))
+                # or a single value
+                except:
+                    r += ' --{0}port {1}'.format(srcdst, port_override)
+            else:
+                r += ' --{0}port {1}'.format(srcdst, ':'.join(map(str, params[port])))
 
         return r
 
@@ -460,12 +468,14 @@ class Rule:
                 ('from_port' in params and params['from_port']) or
                 ('nat_port' in params and params['nat_port']))
         protocol = params['protocol'] if 'protocol' in params else None
+
         if port or protocol:
-            if port and not protocol:
-                # If a port has been specified without a protocol, add a default 'all' protocol.
-                protocol = 'all'
-            return ' -p ' + protocol
-        return ''
+            if port and protocol in (None, 'all'):
+                # If a port has been specified without a protocol, we must create two rules with
+                # tcp and udp as protocols since iptables no more supports all protocol with ports
+                return [' -p ' + p for p in ('tcp', 'udp')]
+            return [' -p ' + protocol]
+        return ['']
 
     @staticmethod
     def format_rule(fmt, params):
@@ -473,9 +483,12 @@ class Rule:
             # Escape the " character
             params['rule_escaped'] = params['abstract'].replace('"', '\\"')
             fmt += ' -m comment --comment "{rule_escaped}"'
-        params['proto'] = Rule._format_protocol(params)
-        rule = re.sub(' +', ' ', fmt.format(**params))
-        return rule
+        proto_list = Rule._format_protocol(params)
+        rules = []
+        for proto in proto_list:
+            params['proto'] = proto
+            rules.append(re.sub(' +', ' ', fmt.format(**params)))
+        return rules
 
     def _forward(self, params, flip=False):
         '''Translation for ">".
@@ -498,35 +511,35 @@ class Rule:
             # but as we know how to do it without it, maybe it's better? We should think about it.
             params['source'] = self._format_intfip('s', dir1, params, portonly=True)
             params['destination'] = self._format_intfip('d', dir2, params)
-            rules.append(self.format_rule('-A OUTPUT {proto} {source} {destination} {filters} -j ACCEPT', params))
+            rules.extend(self.format_rule('-A OUTPUT {proto} {source} {destination} {filters} -j ACCEPT', params))
             params['source'] = self._format_intfip('s', dir2, params)
             params['destination'] = self._format_intfip('d', dir1, params, portonly=True)
-            rules.append(self.format_rule('-A INPUT {proto} {source} {destination} {filters} -j ACCEPT', params))
+            rules.extend(self.format_rule('-A INPUT {proto} {source} {destination} {filters} -j ACCEPT', params))
         elif params['from_alias'] == 'local':
             # OUTPUT rule
             if flip:
                 params['source'] = self._format_intfip('s', dir2, params)
                 params['destination'] = self._format_intfip('d', dir1, params, portonly=True)
-                rules.append(self.format_rule('-A INPUT {proto} {source} {destination} {filters} -j ACCEPT', params))
+                rules.extend(self.format_rule('-A INPUT {proto} {source} {destination} {filters} -j ACCEPT', params))
             else:
                 params['source'] = self._format_intfip('s', dir1, params, portonly=True)
                 params['destination'] = self._format_intfip('d', dir2, params)
-                rules.append(self.format_rule('-A OUTPUT {proto} {source} {destination} {filters} -j ACCEPT', params))
+                rules.extend(self.format_rule('-A OUTPUT {proto} {source} {destination} {filters} -j ACCEPT', params))
         elif params['to_alias'] == 'local':
             # INPUT rule
             if flip:
                 params['source'] = self._format_intfip('s', dir2, params, portonly=True)
                 params['destination'] = self._format_intfip('d', dir1, params)
-                rules.append(self.format_rule('-A OUTPUT {proto} {source} {destination} {filters} -j ACCEPT', params))
+                rules.extend(self.format_rule('-A OUTPUT {proto} {source} {destination} {filters} -j ACCEPT', params))
             else:
                 params['source'] = self._format_intfip('s', dir1, params)
                 params['destination'] = self._format_intfip('d', dir2, params, portonly=True)
-                rules.append(self.format_rule('-A INPUT {proto} {source} {destination} {filters} -j ACCEPT', params))
+                rules.extend(self.format_rule('-A INPUT {proto} {source} {destination} {filters} -j ACCEPT', params))
         else:
             # FORWARD rule
             params['source'] = self._format_intfip('s', dir1, params)
             params['destination'] = self._format_intfip('d', dir2, params)
-            rules.append(self.format_rule('-A FORWARD {proto} {source} {destination} {filters} -j ACCEPT', params))
+            rules.extend(self.format_rule('-A FORWARD {proto} {source} {destination} {filters} -j ACCEPT', params))
         return rules
 
     def _dbl_forward(self, params):
@@ -559,7 +572,7 @@ class Rule:
             params['source'] = self._format_intfip('s', 'from', params)
             params['destination'] = self._format_intfip('d', 'to', params)
             chain = 'FORWARD'
-        rules.append(
+        rules.extend(
             self.format_rule('-A ' + chain + ' {proto} {source} {destination} {filters} -j ' + target, params))
 
         return rules
@@ -572,6 +585,8 @@ class Rule:
 
         if masquerade:
             target = 'MASQUERADE'
+            if params['from_alias'] == 'local':
+                raise MignisException(self, 'Masquerade unsupported when the source is local')
         else:
             params['nat'] = str(params['nat_ip'])
             if params['nat_port']:
@@ -579,7 +594,7 @@ class Rule:
             target = 'SNAT --to-source {nat}'
         params['source'] = self._format_intfip('s', 'from', params, iponly=True)
         params['destination'] = self._format_intfip('d', 'to', params)
-        rules.append(
+        rules.extend(
             self.format_rule('-t nat -A POSTROUTING {proto} {source} {destination} {filters} -j ' + target, params))
         return rules
 
@@ -593,8 +608,14 @@ class Rule:
 
         params['source'] = self._format_intfip('s', 'from', params)
         params['destination'] = self._format_intfip('d', 'to', params, iponly=True)
-        rules.append(self.format_rule(
-            '-t mangle -A PREROUTING {proto} {source} {destination} {filters} -m state --state NEW -j DROP', params))
+        if params['from_alias'] != 'local':
+            rules.extend(self.format_rule(
+                '-t mangle -A PREROUTING {proto} {source} {destination} {filters} -m state --state NEW -j DROP', params))
+        # Block direct connections to the final port of dnat
+        if params['to_alias'] == 'local':
+            params['destination'] = self._format_intfip('d', 'nat', params, iponly=True, port_override=params['to_port'])
+            rules.extend(self.format_rule(
+                '-t mangle -A PREROUTING {proto} {source} {destination} {filters} -m state --state NEW -j DROP', params))
 
         # Forward rules without filters
         filters = params['filters']
@@ -610,12 +631,20 @@ class Rule:
             params['chain'] = 'PREROUTING'
 
         params['destination'] = self._format_intfip('d', 'nat', params, iponly=True)
-        # TODO: verify that to_ip is not None.
+        if params['to_ip'] is None:
+            raise MignisException(self, 'Destination "{:s}" in rule "{:s}" is '
+                                        'invalid or not an alias.'.format(params['to_alias'],
+                                            params['abstract_collapsed']))
         params['nat'] = str(params['to_ip'])
         if params['to_port']:
             params['nat'] += ':' + '-'.join(map(str, params['to_port']))
-        rules.append(self.format_rule(
-            '-t nat -A {chain} {proto} {source} {destination} {filters} -j DNAT --to-destination {nat}', params))
+            params['local_nat'] = '-'.join(map(str, params['to_port']))
+        if params['to_alias'] == 'local':
+            rules.extend(self.format_rule(
+                '-t nat -A {chain} {proto} {source} {destination} {filters} -j REDIRECT --to-ports {local_nat}', params))
+        else:
+            rules.extend(self.format_rule(
+                '-t nat -A {chain} {proto} {source} {destination} {filters} -j DNAT --to-destination {nat}', params))
         return rules
     ##
 
@@ -812,11 +841,10 @@ class Mignis:
     #        sys.exit(-3)
 
     def add_iptables_rule(self, r, params=None):
-        if params:
-            r = Rule.format_rule(r, params)
+        r = Rule.format_rule(r, params) if params else [r]
         if self.debug >= 1:
             print('iptables ' + r)
-        self.iptables_rules.append(r)
+        self.iptables_rules.extend(r)
 
     def prune_duplicated_rules(self):
         if self.debug >= 1:
@@ -1540,8 +1568,8 @@ def parse_args():
     config_group = config_group.add_mutually_exclusive_group(required=False)
     config_group.add_argument('-w', '--write', dest='write_rules_filename', metavar='filename',
                               help='write the rules to file', required=False)
-    config_group.add_argument('-e', '--execute', dest='execute_rules', 
-                              help='execute the rules without writing to file', required=False, 
+    config_group.add_argument('-e', '--execute', dest='execute_rules',
+                              help='execute the rules without writing to file', required=False,
                               action='store_true')
     config_group.add_argument('-q', '--query', dest='query_rules', metavar='query',
                               help='perform a query over the configuration (unstable)', required=False)
@@ -1566,8 +1594,8 @@ def main():
     args = parse_args()
 
     try:
-        mignis = Mignis(args['config_file'], args['debug'], args['force'], args['dryrun'], 
-            args['write_rules_filename'], args['execute_rules'], args['flush'])
+        mignis = Mignis(args['config_file'], args['debug'], args['force'], args['dryrun'],
+                        args['write_rules_filename'], args['execute_rules'], args['flush'])
 
         if args['query_rules']:
             mignis.query_rules(args['query_rules'])
